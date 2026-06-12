@@ -23,11 +23,13 @@ import android.util.Log
 import androidx.annotation.RequiresApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.CancellableContinuation
 import org.autojs.autojs.core.plugin.center.PluginEnableStore
 import org.autojs.autojs.core.plugin.center.PluginTrustManager
+import org.autojs.autojs.core.plugin.center.PluginWakeManager
 import org.autojs.plugin.paddle.ocr.api.IOcrPlugin
 import org.autojs.plugin.paddle.ocr.api.OcrOptions
 import org.autojs.plugin.paddle.ocr.api.OcrResult
@@ -57,6 +59,7 @@ object PaddleOcrPluginHost {
     private const val EXTRA_RAW_STRIDE = "rawStride"
     private const val EXTRA_RAW_CONFIG = "rawConfig"
     private const val IDLE_UNBIND_MS = 30_000L
+    private const val WAKE_RETRY_DELAY_MS = 800L
 
     private val externalServiceFlag = runCatching { ServiceInfo::class.java.getField("FLAG_EXTERNAL_SERVICE").getInt(null) }.getOrNull() ?: 0
     private val bindExternalServiceFlag = runCatching { Context::class.java.getField("BIND_EXTERNAL_SERVICE").getInt(null) }.getOrNull() ?: 0
@@ -75,7 +78,11 @@ object PaddleOcrPluginHost {
         Log.i(TAG, "discover: services=${services.size}")
         return services.map { svc ->
             Log.i(TAG, "discover: ${svc.packageName}/${svc.name}")
-            val result = runCatching { withService(context, svc, DEFAULT_BIND_TIMEOUT_MS) { it.getInfo() } }
+            val result = runCatching {
+                withWakeRetry(context, svc.packageName, "getInfo") {
+                    withService(context, svc, DEFAULT_BIND_TIMEOUT_MS) { it.getInfo() }
+                }
+            }
             val info = result.getOrNull()
             val error = result.exceptionOrNull()
             if (error != null) {
@@ -91,7 +98,9 @@ object PaddleOcrPluginHost {
         }
         val serviceInfo = queryOcrServices(context, packageName).firstOrNull()
             ?: error("No OCR service found for package: $packageName")
-        return withService(context, serviceInfo, DEFAULT_BIND_TIMEOUT_MS) { it.getInfo() }
+        return withWakeRetry(context, packageName, "probe") {
+            withService(context, serviceInfo, DEFAULT_BIND_TIMEOUT_MS) { it.getInfo() }
+        }
     }
 
     suspend fun recognizeText(
@@ -107,12 +116,14 @@ object PaddleOcrPluginHost {
         ensureRawSupport(target, options)
         val start = uptimeMillis()
         return createTempPfd(bitmap, options).use { pfd ->
-            withService(context, target.serviceInfo, DEFAULT_BIND_TIMEOUT_MS) { proxy ->
-                val remain = callTimeoutMs - (uptimeMillis() - start)
-                if (remain <= 0) error("AIDL call timeout in ${callTimeoutMs / 1000} seconds")
-                val lines = proxy.recognizeText(pfd, options)
-                Log.i(TAG, "recognizeTextAidl: got ${lines.size} lines")
-                lines
+            withWakeRetry(context, target.serviceInfo.packageName, "recognizeText") {
+                withService(context, target.serviceInfo, DEFAULT_BIND_TIMEOUT_MS) { proxy ->
+                    val remain = callTimeoutMs - (uptimeMillis() - start)
+                    if (remain <= 0) error("AIDL call timeout in ${callTimeoutMs / 1000} seconds")
+                    val lines = proxy.recognizeText(pfd, options)
+                    Log.i(TAG, "recognizeTextAidl: got ${lines.size} lines")
+                    lines
+                }
             }
         }
     }
@@ -130,13 +141,52 @@ object PaddleOcrPluginHost {
         ensureRawSupport(target, options)
         val start = uptimeMillis()
         return createTempPfd(bitmap, options).use { pfd ->
-            withService(context, target.serviceInfo, DEFAULT_BIND_TIMEOUT_MS) { proxy ->
-                val remain = callTimeoutMs - (uptimeMillis() - start)
-                if (remain <= 0) error("AIDL call timeout")
-                val results = proxy.detect(pfd, options)
-                Log.i(TAG, "detectAidl: got ${results.size} items")
-                results
+            withWakeRetry(context, target.serviceInfo.packageName, "detect") {
+                withService(context, target.serviceInfo, DEFAULT_BIND_TIMEOUT_MS) { proxy ->
+                    val remain = callTimeoutMs - (uptimeMillis() - start)
+                    if (remain <= 0) error("AIDL call timeout")
+                    val results = proxy.detect(pfd, options)
+                    Log.i(TAG, "detectAidl: got ${results.size} items")
+                    results
+                }
             }
+        }
+    }
+
+    private suspend fun <T> withWakeRetry(
+        context: Context,
+        packageName: String,
+        phase: String,
+        block: suspend () -> T,
+    ): T {
+        val first = runCatching { block() }
+        val error = first.exceptionOrNull() ?: return first.getOrThrow()
+        if (!shouldRetryAfterWake(error)) {
+            throw error
+        }
+        val woke = runCatching { PluginWakeManager.tryAutoWakeIfNeeded(context, packageName) }.getOrDefault(false)
+        if (!woke) {
+            throw error
+        }
+        Log.i(TAG, "auto wake succeeded for $packageName during $phase, retrying once")
+        delay(WAKE_RETRY_DELAY_MS)
+        val retry = runCatching { block() }
+        retry.exceptionOrNull()?.addSuppressed(error)
+        return retry.getOrThrow()
+    }
+
+    private fun shouldRetryAfterWake(error: Throwable): Boolean {
+        val message = error.message.orEmpty()
+        return when {
+            error is SecurityException -> false
+            message.contains("Plugin not authorized", ignoreCase = true) -> false
+            message.contains("stopped=true", ignoreCase = true) -> true
+            message.contains("bindService failed", ignoreCase = true) -> true
+            message.contains("bindService timeout", ignoreCase = true) -> true
+            message.contains("onBindingDied", ignoreCase = true) -> true
+            message.contains("onNullBinding", ignoreCase = true) -> true
+            message.contains("onServiceDisconnected", ignoreCase = true) -> true
+            else -> false
         }
     }
 

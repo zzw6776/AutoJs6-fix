@@ -262,6 +262,9 @@ dependencies /* Unclassified */ {
 
     // Plugin API: Paddle OCR Engine
     implementation(project(":plugin-api:paddle-ocr-engine"))
+
+    // Embedded Paddle OCR v5 runtime assets and native libraries.
+    implementation(files("$rootDir/libs/paddleocr-v5-embedded.aar"))
 }
 
 dependencies /* MIME */ {

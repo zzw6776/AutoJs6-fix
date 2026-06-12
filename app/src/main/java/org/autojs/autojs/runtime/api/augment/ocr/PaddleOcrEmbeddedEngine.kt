@@ -8,6 +8,7 @@ import com.baidu.paddle.lite.ocr.VariantSpec
 import org.autojs.autojs6.R
 import org.autojs.plugin.paddle.ocr.api.OcrOptions
 import org.autojs.plugin.paddle.ocr.api.OcrResult
+import java.io.File
 
 internal object PaddleOcrEmbeddedEngine {
 
@@ -65,6 +66,22 @@ internal object PaddleOcrEmbeddedEngine {
         } catch (_: Throwable) {
             false
         }
+    }
+
+    fun isAvailable(context: Context): Boolean {
+        val assets = context.applicationContext.assets
+        val hasV5Assets = assets.hasAsset("labels/ppocr_keys_ocrv5.txt") &&
+                assets.hasAsset("models/pp-ocrv5-arm/PP-OCRv5_mobile_det.nb")
+        val hasV3Assets = assets.hasAsset("labels/ppocr_keys_v1.txt") &&
+                assets.hasAsset("models/ocr_v3_for_cpu/det_opt.nb")
+        if (!hasV5Assets && !hasV3Assets) return false
+
+        val nativeLibDir = context.applicationInfo.nativeLibraryDir?.let(::File) ?: return false
+        return listOf(
+            "libopencv_java4.so",
+            "libNative.so",
+            "libpaddle_light_api_shared.so",
+        ).all { File(nativeLibDir, it).isFile }
     }
 
     fun recognizeText(context: Context, bitmap: Bitmap, options: OcrOptions): List<String> {

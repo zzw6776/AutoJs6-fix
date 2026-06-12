@@ -79,7 +79,9 @@ class OcrPaddle(private val scriptRuntime: ScriptRuntime) : Augmentable(scriptRu
                 this.scoreThreshold = parsed.scoreThreshold
                 this.extras = parsed.extras
             }
-            return if (!isInrt) {
+            return if (PaddleOcrEmbeddedEngine.isAvailable(globalContext)) {
+                PaddleOcrEmbeddedEngine.recognizeText(globalContext, image.bitmap, ocrOptions)
+            } else if (!isInrt) {
                 runBlocking(scriptRuntime.coroutineContext) {
                     val target = PaddleOcrPluginHost.select(globalContext)
                         ?: throw WrappedIllegalArgumentException(globalContext.getString(R.string.error_no_paddle_ocr_plugins_available))
@@ -104,7 +106,11 @@ class OcrPaddle(private val scriptRuntime: ScriptRuntime) : Augmentable(scriptRu
                 this.scoreThreshold = parsed.scoreThreshold
                 this.extras = parsed.extras
             }
-            val results = if (!isInrt) {
+            val results = if (PaddleOcrEmbeddedEngine.isAvailable(globalContext)) {
+                PaddleOcrEmbeddedEngine.detect(globalContext, image.bitmap, ocrOptions).map {
+                    OcrResult(it.text, it.confidence, it.bounds)
+                }
+            } else if (!isInrt) {
                 runBlocking(scriptRuntime.coroutineContext) {
                     val target = PaddleOcrPluginHost.select(globalContext)
                         ?: throw WrappedIllegalArgumentException(globalContext.getString(R.string.error_no_paddle_ocr_plugins_available))
